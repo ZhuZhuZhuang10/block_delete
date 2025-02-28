@@ -1,22 +1,27 @@
-#!/bin/sh
+import subprocess
 
-# Запрашиваем ID у пользователя
-echo "Введите ID:"
-read ID
+def main():
+    user_id = input("Введите ID: ")
+    
+    commands = [
+        "v2bx",
+        "15",
+        "y",
+        "https://bibihy-shop.org",
+        "imlalaimlalaimlala",
+        "y",
+        "1",
+        user_id,
+        "2",
+        "y",
+        "n"
+    ]
+    
+    process = subprocess.Popen(["/bin/bash"], stdin=subprocess.PIPE, text=True)
+    for cmd in commands:
+        process.stdin.write(cmd + "\n")
+    process.stdin.close()
+    process.wait()
 
-# Выполняем команды автоматически
-{
-  echo "v2bx"
-  echo "15"
-  echo "y"
-  echo "https://bibihy-shop.org"
-  echo "imlalaimlalaimlala"
-  echo "y"
-  echo "1"
-  echo "$ID"
-  echo "2"
-  echo "y"
-  echo "n"
-} | some_command
-
-echo "Готово!"
+if __name__ == "__main__":
+    main()
