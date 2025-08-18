@@ -1,6 +1,5 @@
-sudo tee /root/rlsapl_fixed.sh > /dev/null <<'SCRIPT'
 #!/usr/bin/env bash
-# apply_rules_from_url - fixed robust version
+# apply_rules_from_url - fixed robust version with conntrack tuning
 set -o errexit
 set -o nounset
 set -o pipefail
@@ -155,7 +154,7 @@ fi
 # Enable ip forwarding
 SYSCTL_KEY="net.ipv4.ip_forward"
 if $DRY_RUN; then
-  echo "(dry-run) Would set $SYSCTL_KEY = 1 and run sysctl -p"
+  echo "(dry-run) Would set $SYSCTL_KEY = 1 and run sysctl -p (or sysctl --system)"
 else
   if [ "$(sysctl -n $SYSCTL_KEY 2>/dev/null || echo 0)" != "1" ]; then
     if grep -q "^${SYSCTL_KEY}" /etc/sysctl.conf 2>/dev/null; then
@@ -164,7 +163,71 @@ else
       echo "${SYSCTL_KEY} = 1" >> /etc/sysctl.conf
     fi
   fi
-  sysctl -p || echo "Warning: sysctl -p failed"
+  # Try to reload sysctl settings; prefer --system if available
+  if command -v sysctl >/dev/null 2>&1; then
+    if sysctl --system >/dev/null 2>&1; then
+      echo "sysctl settings reloaded with sysctl --system"
+    else
+      sysctl -p || echo "Warning: sysctl -p failed"
+    fi
+  else
+    echo "Warning: sysctl not found; ip_forward persistence applied to file but not reloaded"
+  fi
+fi
+
+# --- New: ensure conntrack max is set and persisted ---
+CONNTRACK_KEY="net.netfilter.nf_conntrack_max"
+CONNTRACK_VALUE="1048576"
+
+echo "Ensuring $CONNTRACK_KEY = $CONNTRACK_VALUE (runtime + persisted)"
+if $DRY_RUN; then
+  echo "(dry-run) Would run: sysctl -w ${CONNTRACK_KEY}=${CONNTRACK_VALUE}"
+  echo "(dry-run) Would persist: write '${CONNTRACK_KEY} = ${CONNTRACK_VALUE}' to /etc/sysctl.d/99-rls.conf (or /etc/sysctl.conf fallback)"
+else
+  if command -v sysctl >/dev/null 2>&1; then
+    # Apply at runtime
+    current_val="$(sysctl -n "$CONNTRACK_KEY" 2>/dev/null || echo "")"
+    if [ "$current_val" = "$CONNTRACK_VALUE" ]; then
+      echo "$CONNTRACK_KEY already set to $CONNTRACK_VALUE (runtime)"
+    else
+      if sysctl -w "${CONNTRACK_KEY}=${CONNTRACK_VALUE}" >/dev/null 2>&1; then
+        echo "Set $CONNTRACK_KEY = $CONNTRACK_VALUE (runtime)"
+      else
+        echo "Warning: failed to set $CONNTRACK_KEY at runtime"
+      fi
+    fi
+
+    # Persist the setting in /etc/sysctl.d/99-rls.conf (preferred)
+    SYSCTL_D_DIR="/etc/sysctl.d"
+    SYSCTL_D_FILE="${SYSCTL_D_DIR}/99-rls.conf"
+    if mkdir -p "$SYSCTL_D_DIR" 2>/dev/null; then
+      if grep -q "^${CONNTRACK_KEY}" "$SYSCTL_D_FILE" 2>/dev/null; then
+        sed -i "s|^${CONNTRACK_KEY}.*|${CONNTRACK_KEY} = ${CONNTRACK_VALUE}|" "$SYSCTL_D_FILE" || echo "${CONNTRACK_KEY} = ${CONNTRACK_VALUE}" >> "$SYSCTL_D_FILE"
+      else
+        echo "${CONNTRACK_KEY} = ${CONNTRACK_VALUE}" >> "$SYSCTL_D_FILE"
+      fi
+      # Try to reload sysctl settings
+      if sysctl --system >/dev/null 2>&1; then
+        echo "Persisted $CONNTRACK_KEY in $SYSCTL_D_FILE and reloaded sysctl --system"
+      else
+        echo "Warning: sysctl --system failed; the value is written to $SYSCTL_D_FILE but may not be active until next boot"
+      fi
+    else
+      # Fallback to /etc/sysctl.conf if /etc/sysctl.d can't be used
+      if grep -q "^${CONNTRACK_KEY}" /etc/sysctl.conf 2>/dev/null; then
+        sed -i "s|^${CONNTRACK_KEY}.*|${CONNTRACK_KEY} = ${CONNTRACK_VALUE}|" /etc/sysctl.conf || echo "${CONNTRACK_KEY} = ${CONNTRACK_VALUE}" >> /etc/sysctl.conf
+      else
+        echo "${CONNTRACK_KEY} = ${CONNTRACK_VALUE}" >> /etc/sysctl.conf
+      fi
+      if sysctl -p >/dev/null 2>&1; then
+        echo "Persisted $CONNTRACK_KEY in /etc/sysctl.conf and reloaded sysctl -p"
+      else
+        echo "Warning: sysctl -p failed; the value is written to /etc/sysctl.conf but may not be active until next boot"
+      fi
+    fi
+  else
+    echo "Warning: sysctl command not found; cannot set $CONNTRACK_KEY"
+  fi
 fi
 
 # Stop/disable ufw quietly
@@ -190,7 +253,3 @@ if ! $DRY_RUN && command -v curl >/dev/null 2>&1; then
 fi
 
 echo "=== Completed successfully. Backup: $BACKUP_FILE ==="
-SCRIPT
-
-# make executable and run
-chmod +x /root/rlsapl_fixed.sh && /root/rlsapl_fixed.sh
