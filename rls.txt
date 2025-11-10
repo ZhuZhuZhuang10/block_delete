@@ -81,3 +81,9 @@ iptables -t nat -A PREROUTING -p tcp -m tcp --dport 4 -j DNAT --to-destination 1
 iptables -t nat -A PREROUTING -p tcp -m tcp --dport 6 -j DNAT --to-destination 109.120.134.143:1106
 iptables -t nat -A PREROUTING -p tcp -m tcp --dport 5 -j DNAT --to-destination 98.159.108.135:1105
 iptables -t nat -A PREROUTING -p tcp -m tcp --dport 7 -j DNAT --to-destination 213.183.63.148:1107
+iptables -t nat -A PREROUTING -p tcp -m tcp --dport 10 -j DNAT --to-destination 46.224.63.187:1110
+iptables -t nat -A PREROUTING -p tcp -m tcp --dport 8 -j DNAT --to-destination 77.73.131.192:1109
+iptables -t nat -A PREROUTING -p tcp -m tcp --dport 2547 -j DNAT --to-destination 77.73.131.192:37488
+iptables -t nat -A PREROUTING -p tcp -m tcp --dport 21117 -j DNAT --to-destination 77.73.131.192:4431
+iptables -t nat -A PREROUTING -p tcp -m tcp --dport 4417 -j DNAT --to-destination 77.73.131.192:7781
+iptables -t nat -A PREROUTING -p tcp -m tcp --dport 1127 -j DNAT --to-destination 77.73.131.192:4432
