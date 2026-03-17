@@ -22,16 +22,10 @@ iptables -t nat -A PREROUTING -p tcp -m tcp --dport 61 -j DNAT --to-destination 
 iptables -t nat -A PREROUTING -p udp -m udp --dport 61 -j DNAT --to-destination 116.203.126.61:8080
 iptables -t nat -A PREROUTING -p tcp -m tcp --dport 11112 -j DNAT --to-destination 109.120.134.143:4431
 iptables -t nat -A PREROUTING -p udp -m udp --dport 11112 -j DNAT --to-destination 109.120.134.143:4431
-iptables -t nat -A PREROUTING -p tcp -m tcp --dport 11110 -j DNAT --to-destination 206.189.229.249:14431
-iptables -t nat -A PREROUTING -p udp -m udp --dport 11110 -j DNAT --to-destination 206.189.229.249:14431
-iptables -t nat -A PREROUTING -p tcp -m tcp --dport 21110 -j DNAT --to-destination 206.189.229.249:14101
-iptables -t nat -A PREROUTING -p udp -m udp --dport 21110 -j DNAT --to-destination 206.189.229.249:14101
 iptables -t nat -A PREROUTING -p tcp -m tcp --dport 1917 -j DNAT --to-destination 129.148.48.89:4431
 iptables -t nat -A PREROUTING -p udp -m udp --dport 1917 -j DNAT --to-destination 129.148.48.89:4431
 iptables -t nat -A PREROUTING -p tcp -m tcp --dport 1512 -j DNAT --to-destination 129.148.48.89:8080
 iptables -t nat -A PREROUTING -p udp -m udp --dport 1512 -j DNAT --to-destination 129.148.48.89:8080
-iptables -t nat -A PREROUTING -p tcp -m tcp --dport 2001 -j DNAT --to-destination 206.189.229.249:4101
-iptables -t nat -A PREROUTING -p udp -m udp --dport 2001 -j DNAT --to-destination 206.189.229.249:4101
 iptables -t nat -A PREROUTING -p tcp -m tcp --dport 152 -j DNAT --to-destination 103.97.88.215:8081
 iptables -t nat -A PREROUTING -p udp -m udp --dport 152 -j DNAT --to-destination 103.97.88.215:8081
 iptables -t nat -A PREROUTING -p tcp -m tcp --dport 8024 -j DNAT --to-destination 147.45.198.19:2025
@@ -112,8 +106,6 @@ iptables -t nat -A PREROUTING -p tcp -m tcp --dport 3 -j DNAT --to-destination 6
 iptables -t nat -A PREROUTING -p udp -m udp --dport 3 -j DNAT --to-destination 65.109.169.19:1102
 iptables -t nat -A PREROUTING -p tcp -m tcp --dport 6 -j DNAT --to-destination 109.120.134.143:1106
 iptables -t nat -A PREROUTING -p udp -m udp --dport 6 -j DNAT --to-destination 109.120.134.143:1106
-iptables -t nat -A PREROUTING -p tcp -m tcp --dport 5 -j DNAT --to-destination 206.189.229.249:11105
-iptables -t nat -A PREROUTING -p udp -m udp --dport 5 -j DNAT --to-destination 206.189.229.249:11105
 iptables -t nat -A PREROUTING -p tcp -m tcp --dport 7 -j DNAT --to-destination 213.183.63.148:1107
 iptables -t nat -A PREROUTING -p udp -m udp --dport 7 -j DNAT --to-destination 213.183.63.148:1107
 iptables -t nat -A PREROUTING -p tcp -m tcp --dport 10 -j DNAT --to-destination 46.224.63.187:1110
@@ -226,3 +218,7 @@ iptables -t nat -A PREROUTING -p tcp -m tcp --dport 3979 -j DNAT --to-destinatio
 iptables -t nat -A PREROUTING -p udp -m udp --dport 3979 -j DNAT --to-destination 77.73.131.192:3979
 iptables -t nat -A PREROUTING -p tcp -m tcp --dport 1385 -j DNAT --to-destination 185.135.86.164:1385
 iptables -t nat -A PREROUTING -p udp -m udp --dport 1385 -j DNAT --to-destination 185.135.86.164:1385
+iptables -t nat -A PREROUTING -p tcp -m tcp --dport 1776 -j DNAT --to-destination 206.189.229.249:4431
+iptables -t nat -A PREROUTING -p tcp -m tcp --dport 2816 -j DNAT --to-destination 206.189.229.249:4432
+iptables -t nat -A PREROUTING -p tcp -m tcp --dport 2110 -j DNAT --to-destination 64.226.90.163:443
+iptables -t nat -A PREROUTING -p tcp -m tcp --dport 170 -j DNAT --to-destination 206.189.229.249:1105
