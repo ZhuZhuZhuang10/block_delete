@@ -530,7 +530,7 @@ if ! \$DRY_RUN; then
     if [ -f "\$RC_LOCAL" ]; then
       RESTORE_CMD="iptables-restore < /etc/iptables/rules.v4"
       if ! grep -qF "\$RESTORE_CMD" "\$RC_LOCAL"; then
-        sed -i '/^exit 0/i '"\\$RESTORE_CMD" "\$RC_LOCAL" && \
+        sed -i '/^exit 0/i '"\\\$RESTORE_CMD" "\$RC_LOCAL"
           echo "[PERSIST] Добавлено в rc.local"
       fi
     fi
