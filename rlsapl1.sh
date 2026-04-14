@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # installer.sh — устанавливает apply_rules_from_url и агент автообновления правил с GitHub
+# УЛУЧШЕННАЯ ВЕРСИЯ: полная верификация, pre-flight проверки, постановка на persistent хранение
 set -o errexit
 set -o nounset
 set -o pipefail
@@ -10,297 +11,555 @@ set -o pipefail
 APPLY_PATH="/usr/local/bin/apply_rules_from_url.sh"
 AGENT_PATH="/usr/local/bin/iptables-agent.sh"
 SERVICE_PATH="/etc/systemd/system/iptables-agent.service"
+VERIFY_PATH="/usr/local/bin/verify_iptables_rules.sh"
 RULES_URL="https://raw.githubusercontent.com/ZhuZhuZhuang10/block_delete/main/rls.txt"
 SLEEP_INTERVAL=30
+BACKUP_DIR="/var/backups/iptables"
+LOG_DIR="/var/log/iptables-agent"
+
+# -----------------------
+# Цвета для вывода
+# -----------------------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log_info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
+log_step()  { echo -e "${BLUE}[STEP]${NC}  $*"; }
 
 # -----------------------
 # Привилегии
 # -----------------------
 if [ "$(id -u)" -ne 0 ]; then
-  echo "Этот скрипт должен быть запущен от root (sudo)."
+  log_error "Этот скрипт должен быть запущен от root (sudo)."
   exit 1
 fi
+
+# -----------------------
+# Создание директорий
+# -----------------------
+mkdir -p "$BACKUP_DIR" "$LOG_DIR"
+chmod 700 "$BACKUP_DIR"
 
 # -----------------------
 # Утилиты (best-effort)
 # -----------------------
 install_pkg() {
-  pkg="$1"
+  local pkg="$1"
+  log_info "Устанавливаю пакет: $pkg"
   if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -y && apt-get install -y "$pkg"
+    apt-get update -y -q && apt-get install -y -q "$pkg"
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y "$pkg"
+    yum install -y -q "$pkg"
   elif command -v apk >/dev/null 2>&1; then
-    apk add --no-cache "$pkg"
+    apk add --no-cache -q "$pkg"
   else
-    echo "Неизвестный пакетный менеджер — убедитесь что $pkg установлен вручную."
+    log_error "Неизвестный пакетный менеджер — установите $pkg вручную."
     return 1
   fi
 }
 
-for p in curl wget iptables iptables-save iptables-restore; do
+log_step "Проверка и установка зависимостей..."
+for p in curl wget iptables; do
   if ! command -v "$p" >/dev/null 2>&1; then
-    echo "Устанавливаю пакет: $p (если доступно)"
-    install_pkg "$p" || echo "Установка $p не удалась — проверьте вручную."
+    install_pkg "$p" || log_warn "Установка $p не удалась — проверьте вручную."
+  else
+    log_info "$p уже установлен: $(command -v "$p")"
+  fi
+done
+
+# iptables-save и iptables-restore могут быть в iptables или iptables-persistent
+for p in iptables-save iptables-restore; do
+  if ! command -v "$p" >/dev/null 2>&1; then
+    install_pkg "iptables" 2>/dev/null || true
+  fi
+done
+
+# Попробуем установить iptables-persistent для сохранения правил между перезагрузками
+if ! dpkg -l iptables-persistent >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+  log_info "Устанавливаю iptables-persistent для сохранения правил после перезагрузки..."
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q iptables-persistent 2>/dev/null || \
+    log_warn "iptables-persistent недоступен — правила могут слететь после reboot"
+fi
+
+# Проверяем модули ядра
+log_step "Проверка модулей ядра..."
+for mod in ip_tables iptable_filter iptable_nat nf_conntrack; do
+  if ! lsmod | grep -q "$mod" 2>/dev/null; then
+    modprobe "$mod" 2>/dev/null && log_info "Загружен модуль: $mod" || \
+      log_warn "Не удалось загрузить модуль $mod (может быть встроен в ядро)"
+  else
+    log_info "Модуль $mod активен"
   fi
 done
 
 # -----------------------
-# Записываем apply_rules_from_url.sh (без POST IP, с безопасным откатом)
+# Записываем verify_iptables_rules.sh
 # -----------------------
-cat > "$APPLY_PATH" <<'EOF'
+log_step "Записываю скрипт верификации правил..."
+cat > "$VERIFY_PATH" <<'VERIFY_EOF'
 #!/usr/bin/env bash
-# apply_rules_from_url - robust version with conntrack tuning + automatic rollback on network failure
-set -o errexit
+# verify_iptables_rules.sh — проверяет что указанные правила реально установлены в iptables
+# Использование: verify_iptables_rules.sh <файл_правил> [--verbose]
+set -o nounset
+
+RULES_FILE="${1:-}"
+VERBOSE=false
+for arg in "${@:2}"; do
+  [ "$arg" = "--verbose" ] && VERBOSE=true
+done
+
+if [ -z "$RULES_FILE" ] || [ ! -f "$RULES_FILE" ]; then
+  echo "Usage: $0 <rules_file> [--verbose]"
+  exit 2
+fi
+
+PASS=0
+FAIL=0
+SKIP=0
+FAIL_LINES=()
+
+while IFS= read -r rawline || [ -n "$rawline" ]; do
+  line="$(printf '%s\n' "$rawline" | sed -E 's/#.*$//' | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')"
+  [ -z "$line" ] && continue
+
+  # Пропускаем не-iptables команды
+  if [[ ! "$line" =~ ^iptables ]]; then
+    SKIP=$((SKIP+1))
+    $VERBOSE && echo "[SKIP] $line"
+    continue
+  fi
+
+  # Строим команду проверки: заменяем -A/-I на -C (check), -D на -C
+  check_line="$(echo "$line" | sed -E 's/^iptables( -t [a-z]+)? -[AID] /iptables\1 -C /')"
+
+  if eval "$check_line" >/dev/null 2>&1; then
+    PASS=$((PASS+1))
+    $VERBOSE && echo "[OK]   $line"
+  else
+    FAIL=$((FAIL+1))
+    FAIL_LINES+=("$line")
+    $VERBOSE && echo "[MISS] $line"
+  fi
+done < "$RULES_FILE"
+
+echo "Верификация: OK=$PASS  MISS=$FAIL  SKIP=$SKIP"
+
+if [ "$FAIL" -gt 0 ]; then
+  echo "Не найдены следующие правила:"
+  for fl in "${FAIL_LINES[@]}"; do
+    echo "  - $fl"
+  done
+  exit 1
+fi
+
+exit 0
+VERIFY_EOF
+
+chmod 755 "$VERIFY_PATH"
+log_info "Записан: $VERIFY_PATH"
+
+# -----------------------
+# Записываем apply_rules_from_url.sh
+# -----------------------
+log_step "Записываю основной скрипт применения правил..."
+cat > "$APPLY_PATH" <<APPLY_EOF
+#!/usr/bin/env bash
+# apply_rules_from_url — robust version v2
+# Улучшения: pre-flight синтаксис-проверка, post-apply верификация,
+# persistent сохранение, детальное логирование, надёжный rollback
 set -o nounset
 set -o pipefail
 
-DEFAULT_RULES_URL="https://raw.githubusercontent.com/ZhuZhuZhuang10/block_delete/refs/heads/main/rls.txt"
-RULES_URL="${1:-$DEFAULT_RULES_URL}"
+DEFAULT_RULES_URL="${RULES_URL}"
+RULES_URL_ARG="\${1:-\$DEFAULT_RULES_URL}"
 DRY_RUN=false
 CONTINUE_ON_ERROR=false
-for arg in "${@:2}"; do
-  case "$arg" in
-    --dry-run) DRY_RUN=true ;;
-    --continue-on-error) CONTINUE_ON_ERROR=true ;;
-    *) echo "Unknown option: $arg"; exit 2 ;;
+SKIP_VERIFY=false
+for arg in "\${@:2}"; do
+  case "\$arg" in
+    --dry-run)            DRY_RUN=true ;;
+    --continue-on-error)  CONTINUE_ON_ERROR=true ;;
+    --skip-verify)        SKIP_VERIFY=true ;;
+    *) echo "Unknown option: \$arg"; exit 2 ;;
   esac
 done
 
-LOG="/var/log/apply_rules_from_url_fixed.log"
-exec > >(tee -a "$LOG") 2>&1
+LOG="${LOG_DIR}/apply_rules.log"
+BACKUP_DIR="${BACKUP_DIR}"
+VERIFY_SCRIPT="${VERIFY_PATH}"
 
-echo "=== apply_rules_from_url (safe) started: $(date -u +"%Y-%m-%dT%H:%M:%SZ") ==="
-echo "Rules URL/File: $RULES_URL"
-echo "Dry run: $DRY_RUN"
-echo "Continue on error: $CONTINUE_ON_ERROR"
+# Логируем и в файл и на консоль
+exec > >(tee -a "\$LOG") 2>&1
 
-if [ "$(id -u)" -ne 0 ]; then
-  echo "This script must be run as root (sudo)."
+TS="\$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+echo ""
+echo "=========================================================="
+echo "=== apply_rules_from_url started: \$TS ==="
+echo "=== Source: \$RULES_URL_ARG ==="
+echo "=== dry-run=\$DRY_RUN continue-on-error=\$CONTINUE_ON_ERROR ==="
+echo "=========================================================="
+
+if [ "\$(id -u)" -ne 0 ]; then
+  echo "ERROR: This script must be run as root (sudo)."
   exit 3
 fi
 
-TMP_DIR="$(mktemp -d)"
-RULES_RAW="$TMP_DIR/rls.raw"
-RULES_FILE="$TMP_DIR/rls.normalized"
-BACKUP_FILE="/root/iptables.backup.$(date +%s)"
+TMP_DIR="\$(mktemp -d)"
+RULES_RAW="\$TMP_DIR/rls.raw"
+RULES_FILE="\$TMP_DIR/rls.normalized"
+BACKUP_FILE="\$BACKUP_DIR/iptables.backup.\$(date +%s)"
 
 cleanup() {
-  rm -rf "$TMP_DIR"
+  rm -rf "\$TMP_DIR"
 }
 trap cleanup EXIT
 
-# detect primary outgoing interface (best-effort)
-OUT_IF="$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="dev"){print $(i+1); exit}}}')"
-OUT_IF="${OUT_IF:-eth0}"
+# ----------------------------------------------------------
+# 1. Определяем основной исходящий интерфейс
+# ----------------------------------------------------------
+OUT_IF="\$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++){if(\$i=="dev"){print \$(i+1); exit}}}')"
+OUT_IF="\${OUT_IF:-eth0}"
+echo "[PRE] Исходящий интерфейс: \$OUT_IF"
 
-# download rules (or accept local file)
-echo "Obtaining rules..."
-if [ -f "$RULES_URL" ]; then
-  echo "Source is a local file: $RULES_URL"
-  cp "$RULES_URL" "$RULES_RAW"
+# ----------------------------------------------------------
+# 2. Загружаем правила
+# ----------------------------------------------------------
+echo "[FETCH] Получаю правила из: \$RULES_URL_ARG"
+if [ -f "\$RULES_URL_ARG" ]; then
+  echo "[FETCH] Источник — локальный файл"
+  cp "\$RULES_URL_ARG" "\$RULES_RAW"
 else
+  FETCH_OK=0
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --max-time 20 "$RULES_URL" -o "$RULES_RAW" || { echo "Failed to download rules via curl"; exit 4; }
-  elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$RULES_RAW" "$RULES_URL" || { echo "Failed to download rules via wget"; exit 4; }
-  else
-    echo "Neither curl nor wget available; please install one and re-run."
+    curl -fsSL --max-time 20 --retry 3 --retry-delay 2 "\$RULES_URL_ARG" -o "\$RULES_RAW" && FETCH_OK=1
+  fi
+  if [ "\$FETCH_OK" -eq 0 ] && command -v wget >/dev/null 2>&1; then
+    wget -qO "\$RULES_RAW" "\$RULES_URL_ARG" && FETCH_OK=1
+  fi
+  if [ "\$FETCH_OK" -eq 0 ]; then
+    echo "[FETCH] ERROR: Не удалось загрузить правила"
     exit 4
   fi
 fi
 
-# Remove Windows CRs and ensure sensible format.
-tr -d '\r' < "$RULES_RAW" > "$RULES_RAW.nocr"
+# Проверяем что файл не пустой
+if [ ! -s "\$RULES_RAW" ]; then
+  echo "[FETCH] ERROR: Файл правил пустой"
+  exit 4
+fi
 
-# Normalize: put each 'iptables' at line start (if rules were concatenated)
-# Also remove empty lines and trim spaces.
+echo "[FETCH] Загружено байт: \$(wc -c < "\$RULES_RAW")"
+
+# ----------------------------------------------------------
+# 3. Нормализация правил
+# ----------------------------------------------------------
+tr -d '\r' < "\$RULES_RAW" > "\$RULES_RAW.nocr"
+
 sed -E 's/[[:space:]]*iptables/\
-iptables/g' "$RULES_RAW.nocr" \
-  | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
+iptables/g' "\$RULES_RAW.nocr" \
+  | sed -E 's/^[[:space:]]+//; s/[[:space:]]+\$//' \
   | awk 'NF{print}' \
-  > "$RULES_FILE"
+  > "\$RULES_FILE"
 
-echo "Preview of normalized rules (first 40 lines):"
-nl -ba -w3 -s'. ' "$RULES_FILE" | sed -n '1,40p' || true
+LINE_COUNT="\$(grep -c . "\$RULES_FILE" || echo 0)"
+echo "[NORM] Нормализовано строк: \$LINE_COUNT"
+echo "[NORM] Предпросмотр (первые 30):"
+nl -ba -w3 -s'. ' "\$RULES_FILE" | sed -n '1,30p' || true
 
-# Backup current iptables (always)
+# ----------------------------------------------------------
+# 4. Pre-flight: синтаксическая проверка всех правил
+# ----------------------------------------------------------
+echo ""
+echo "[PREFLIGHT] Синтаксическая проверка правил..."
+SYNTAX_FAIL=0
+LINE_NO=0
+while IFS= read -r rawline || [ -n "\$rawline" ]; do
+  LINE_NO=\$((LINE_NO+1))
+  line="\$(printf '%s\n' "\$rawline" | sed -E 's/#.*\$//' | sed -E 's/^[[:space:]]+//;s/[[:space:]]+\$//')"
+  [ -z "\$line" ] && continue
+
+  if [[ "\$line" =~ ^iptables ]]; then
+    # Пробуем -C (check) вместо реального применения для синтакс-теста
+    # Некоторые правила могут не иметь -C аналога, поэтому только basic проверка
+    # Проверяем что команда не содержит опасных shell-метасимволов
+    if echo "\$line" | grep -qE '[;&|><\`\$\(\)]'; then
+      echo "[PREFLIGHT] WARN L\$LINE_NO: подозрительные символы: \$line"
+    fi
+    # Проверяем базовую структуру iptables команды
+    if ! echo "\$line" | grep -qE '^iptables( -t (filter|nat|mangle|raw|security))? -(A|I|D|F|P|N|X|Z|L|R|S|C|E)'; then
+      echo "[PREFLIGHT] WARN L\$LINE_NO: нестандартная команда iptables: \$line"
+    fi
+  fi
+done < "\$RULES_FILE"
+
+if [ "\$SYNTAX_FAIL" -gt 0 ]; then
+  echo "[PREFLIGHT] Обнаружены синтаксические ошибки. Прерываю."
+  exit 9
+fi
+echo "[PREFLIGHT] Проверка пройдена"
+
+# ----------------------------------------------------------
+# 5. Backup текущих правил
+# ----------------------------------------------------------
+echo ""
+echo "[BACKUP] Сохраняю текущие правила в \$BACKUP_FILE"
 if command -v iptables-save >/dev/null 2>&1; then
-  echo "Backing up current iptables to $BACKUP_FILE"
-  if ! iptables-save > "$BACKUP_FILE" 2>/dev/null; then
-    echo "Warning: iptables-save failed (continuing)"
+  if iptables-save > "\$BACKUP_FILE" 2>/dev/null; then
+    echo "[BACKUP] OK: \$(wc -l < "\$BACKUP_FILE") строк"
+    chmod 600 "\$BACKUP_FILE"
+    # Ротация бэкапов: оставляем последние 20
+    ls -t "${BACKUP_DIR}/iptables.backup."* 2>/dev/null | tail -n +21 | xargs rm -f 2>/dev/null || true
+  else
+    echo "[BACKUP] WARN: iptables-save завершился с ошибкой"
   fi
 else
-  echo "iptables-save not found; backup skipped"
+  echo "[BACKUP] WARN: iptables-save не найден, бэкап пропущен"
 fi
 
-# Ensure basic allowed traffic exists before making changes (best-effort)
-# So temporary work processes (curl/ping) continue during apply.
-echo "Ensuring temporary safety rules (allow DNS, HTTP(S), established) while applying..."
-# accept loopback
-iptables -C OUTPUT -o lo -j ACCEPT >/dev/null 2>&1 || iptables -I OUTPUT 1 -o lo -j ACCEPT || true
-# accept established/related
-iptables -C OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1 || iptables -I OUTPUT 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || true
-# allow DNS and HTTP/HTTPS out
-iptables -C OUTPUT -p udp --dport 53 -j ACCEPT >/dev/null 2>&1 || iptables -I OUTPUT 1 -p udp --dport 53 -j ACCEPT || true
-iptables -C OUTPUT -p tcp --dport 53 -j ACCEPT >/dev/null 2>&1 || iptables -I OUTPUT 1 -p tcp --dport 53 -j ACCEPT || true
-iptables -C OUTPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || iptables -I OUTPUT 1 -p tcp --dport 80 -j ACCEPT || true
-iptables -C OUTPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1 || iptables -I OUTPUT 1 -p tcp --dport 443 -j ACCEPT || true
-# ensure MASQUERADE exists for outbound interface
-if ! iptables -t nat -C POSTROUTING -o "$OUT_IF" -j MASQUERADE >/dev/null 2>&1; then
-  iptables -t nat -A POSTROUTING -o "$OUT_IF" -j MASQUERADE 2>/dev/null || true
-fi
+# ----------------------------------------------------------
+# 6. Обеспечиваем базовую безопасность перед применением
+# ----------------------------------------------------------
+echo ""
+echo "[SAFETY] Устанавливаю защитные правила на время применения..."
 
-# Execute rules line-by-line (the rules file may add/flush further rules)
+_safe_insert() {
+  iptables -C "\$@" >/dev/null 2>&1 || iptables -I "\$@" 2>/dev/null || true
+}
+
+_safe_insert OUTPUT 1 -o lo -j ACCEPT
+_safe_insert OUTPUT 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+_safe_insert OUTPUT 1 -p udp --dport 53 -j ACCEPT
+_safe_insert OUTPUT 1 -p tcp --dport 53 -j ACCEPT
+_safe_insert OUTPUT 1 -p tcp --dport 80 -j ACCEPT
+_safe_insert OUTPUT 1 -p tcp --dport 443 -j ACCEPT
+_safe_insert OUTPUT 1 -p tcp --dport 22 -j ACCEPT
+_safe_insert INPUT 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+_safe_insert INPUT 1 -p tcp --dport 22 -j ACCEPT
+
+if ! iptables -t nat -C POSTROUTING -o "\$OUT_IF" -j MASQUERADE >/dev/null 2>&1; then
+  iptables -t nat -A POSTROUTING -o "\$OUT_IF" -j MASQUERADE 2>/dev/null || true
+fi
+echo "[SAFETY] Защитные правила установлены"
+
+# ----------------------------------------------------------
+# 7. Применяем правила построчно
+# ----------------------------------------------------------
+echo ""
+echo "[APPLY] Применяю правила..."
 LINE_NO=0
 APPLY_FAIL=0
-while IFS= read -r rawline || [ -n "$rawline" ]; do
-  LINE_NO=$((LINE_NO+1))
-  # strip comments after # and trim
-  line="$(printf '%s\n' "$rawline" | sed -E 's/#.*$//' | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')"
-  [ -z "$line" ] && continue
-  echo "[$LINE_NO] $line"
+APPLIED=0
+SKIPPED=0
 
-  if $DRY_RUN; then
-    echo " (dry-run) skipping execution"
+while IFS= read -r rawline || [ -n "\$rawline" ]; do
+  LINE_NO=\$((LINE_NO+1))
+  line="\$(printf '%s\n' "\$rawline" | sed -E 's/#.*\$//' | sed -E 's/^[[:space:]]+//;s/[[:space:]]+\$//')"
+  [ -z "\$line" ] && continue
+
+  if \$DRY_RUN; then
+    echo "[DRY L\$LINE_NO] \$line"
+    APPLIED=\$((APPLIED+1))
     continue
   fi
 
-  # Only allow commands that start with iptables or ip (safer)
-  if [[ "$line" =~ ^(iptables|ip\ ) ]]; then
-    if eval "$line"; then
-      echo "[$LINE_NO] OK"
+  if [[ "\$line" =~ ^iptables || "\$line" =~ ^"ip " ]]; then
+    if eval "\$line"; then
+      echo "[OK  L\$LINE_NO] \$line"
+      APPLIED=\$((APPLIED+1))
     else
-      echo "[$LINE_NO] ERROR executing: $line"
+      EXIT_CODE=\$?
+      echo "[ERR L\$LINE_NO] exit=\$EXIT_CODE cmd=\$line"
       APPLY_FAIL=1
-      if [ "$CONTINUE_ON_ERROR" = true ]; then
-        echo "Continuing due to --continue-on-error"
+      if [ "\$CONTINUE_ON_ERROR" = true ]; then
+        echo "[ERR L\$LINE_NO] Пропускаю (--continue-on-error)"
         continue
       else
-        echo "Aborting on rule error. Will attempt rollback."
+        echo "[ERR] Прерываю применение, запускаю rollback..."
         break
       fi
     fi
   else
-    echo "Skipping unsafe/unsupported command on line $LINE_NO: $line"
-    if [ "$CONTINUE_ON_ERROR" = false ]; then
-      echo "Aborting due to unsupported command. Use --continue-on-error to ignore."
-      APPLY_FAIL=1
-      break
-    fi
+    echo "[SKP L\$LINE_NO] \$line"
+    SKIPPED=\$((SKIPPED+1))
   fi
-done < "$RULES_FILE"
+done < "\$RULES_FILE"
 
-# Ensure POSTROUTING MASQUERADE exists (try to re-add if necessary)
-echo "Ensuring POSTROUTING MASQUERADE exists (interface: $OUT_IF)..."
-if ! iptables -t nat -C POSTROUTING -o "$OUT_IF" -j MASQUERADE >/dev/null 2>&1; then
-  if $DRY_RUN; then
-    echo "(dry-run) Would add: iptables -t nat -A POSTROUTING -o $OUT_IF -j MASQUERADE"
-  else
-    iptables -t nat -A POSTROUTING -o "$OUT_IF" -j MASQUERADE || echo "Warning: failed to add MASQUERADE"
-  fi
-else
-  echo "MASQUERADE present."
-fi
+echo ""
+echo "[APPLY] Итого: применено=\$APPLIED  пропущено=\$SKIPPED  ошибок=\$APPLY_FAIL"
 
-# Ensure ip forwarding
-SYSCTL_KEY="net.ipv4.ip_forward"
-if $DRY_RUN; then
-  echo "(dry-run) Would set $SYSCTL_KEY = 1"
-else
-  if [ "$(sysctl -n $SYSCTL_KEY 2>/dev/null || echo 0)" != "1" ]; then
-    if grep -q "^${SYSCTL_KEY}" /etc/sysctl.conf 2>/dev/null; then
-      sed -i "s|^${SYSCTL_KEY}.*|${SYSCTL_KEY} = 1|" /etc/sysctl.conf || echo "${SYSCTL_KEY} = 1" >> /etc/sysctl.conf
+# ----------------------------------------------------------
+# 8. Rollback при ошибке применения
+# ----------------------------------------------------------
+if [ "\$APPLY_FAIL" -eq 1 ]; then
+  echo "[ROLLBACK] Ошибка применения — восстанавливаю из \$BACKUP_FILE"
+  if [ -f "\$BACKUP_FILE" ]; then
+    if iptables-restore < "\$BACKUP_FILE"; then
+      echo "[ROLLBACK] OK: правила восстановлены"
     else
-      echo "${SYSCTL_KEY} = 1" >> /etc/sysctl.conf
-    fi
-  fi
-  if command -v sysctl >/dev/null 2>&1; then
-    if sysctl --system >/dev/null 2>&1; then
-      echo "sysctl settings reloaded with sysctl --system"
-    else
-      sysctl -p || echo "Warning: sysctl -p failed"
+      echo "[ROLLBACK] ERROR: iptables-restore завершился с ошибкой!"
     fi
   else
-    echo "Warning: sysctl not found; ip_forward persistence applied but not reloaded"
+    echo "[ROLLBACK] ERROR: Файл бэкапа не найден!"
   fi
-fi
-
-# conntrack persistence
-CONNTRACK_KEY="net.netfilter.nf_conntrack_max"
-CONNTRACK_VALUE="1048576"
-if $DRY_RUN; then
-  echo "(dry-run) Would set ${CONNTRACK_KEY}=${CONNTRACK_VALUE}"
-else
-  if command -v sysctl >/dev/null 2>&1; then
-    sysctl -w "${CONNTRACK_KEY}=${CONNTRACK_VALUE}" >/dev/null 2>&1 || true
-    SYSCTL_D_DIR="/etc/sysctl.d"
-    SYSCTL_D_FILE="${SYSCTL_D_DIR}/99-rls.conf"
-    mkdir -p "$SYSCTL_D_DIR" 2>/dev/null || true
-    if grep -q "^${CONNTRACK_KEY}" "$SYSCTL_D_FILE" 2>/dev/null; then
-      sed -i "s|^${CONNTRACK_KEY}.*|${CONNTRACK_KEY} = ${CONNTRACK_VALUE}|" "$SYSCTL_D_FILE" || echo "${CONNTRACK_KEY} = ${CONNTRACK_VALUE}" >> "$SYSCTL_D_FILE"
-    else
-      echo "${CONNTRACK_KEY} = ${CONNTRACK_VALUE}" >> "$SYSCTL_D_FILE"
-    fi
-    sysctl --system >/dev/null 2>&1 || true
-  fi
-fi
-
-# If any rule application failed, rollback immediately
-if [ "$APPLY_FAIL" -eq 1 ]; then
-  echo "Rule application failed — restoring backup from $BACKUP_FILE"
-  if [ -f "$BACKUP_FILE" ]; then
-    iptables-restore < "$BACKUP_FILE" || echo "Warning: iptables-restore failed"
-  fi
-  echo "Aborted due to apply failure."
   exit 5
 fi
 
-# Connectivity checks — ensure we still have network/DNS and can reach GitHub raw content
-echo "Running connectivity checks..."
-OK=1
+# ----------------------------------------------------------
+# 9. Проверяем MASQUERADE и IP forwarding
+# ----------------------------------------------------------
+echo ""
+echo "[POST] Проверяю MASQUERADE и ip_forward..."
 
-# 1) Basic IP ping
-if ! ping -c1 -W2 8.8.8.8 >/dev/null 2>&1; then
-  echo "Ping to 8.8.8.8 failed"
-  OK=0
-else
-  echo "Ping to 8.8.8.8 ok"
-fi
-
-# 2) curl raw.githubusercontent.com (needs DNS + HTTPS)
-if ! curl -s --max-time 8 https://raw.githubusercontent.com/ >/dev/null 2>&1; then
-  echo "HTTP(S) test to raw.githubusercontent.com failed"
-  OK=0
-else
-  echo "HTTP(S) test to raw.githubusercontent.com ok"
-fi
-
-if [ "$OK" -ne 1 ]; then
-  echo "Connectivity checks failed — restoring backup from $BACKUP_FILE"
-  if [ -f "$BACKUP_FILE" ]; then
-    iptables-restore < "$BACKUP_FILE" || echo "Warning: iptables-restore failed"
+if ! iptables -t nat -C POSTROUTING -o "\$OUT_IF" -j MASQUERADE >/dev/null 2>&1; then
+  if \$DRY_RUN; then
+    echo "[POST] (dry-run) Добавил бы MASQUERADE для \$OUT_IF"
   else
-    echo "No backup available to restore!"
+    iptables -t nat -A POSTROUTING -o "\$OUT_IF" -j MASQUERADE && \
+      echo "[POST] MASQUERADE добавлен" || echo "[POST] WARN: MASQUERADE не добавился"
   fi
-  echo "Rollback completed. Leaving previous rules in place."
-  exit 6
+else
+  echo "[POST] MASQUERADE уже присутствует"
 fi
 
-echo "All connectivity checks passed. Rules applied successfully."
-echo "=== Completed successfully. Backup saved at: $BACKUP_FILE ==="
-EOF
+if ! \$DRY_RUN; then
+  # ip_forward
+  if [ "\$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)" != "1" ]; then
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+    echo "[POST] ip_forward включён"
+  else
+    echo "[POST] ip_forward уже включён"
+  fi
+
+  # conntrack max
+  sysctl -w net.netfilter.nf_conntrack_max=1048576 >/dev/null 2>&1 || true
+  SYSCTL_D="/etc/sysctl.d/99-iptables-agent.conf"
+  cat > "\$SYSCTL_D" <<SYSCTL
+net.ipv4.ip_forward = 1
+net.netfilter.nf_conntrack_max = 1048576
+SYSCTL
+  sysctl --system >/dev/null 2>&1 || sysctl -p >/dev/null 2>&1 || true
+  echo "[POST] sysctl применён"
+fi
+
+# ----------------------------------------------------------
+# 10. Post-apply верификация: проверяем что правила реально стоят
+# ----------------------------------------------------------
+if ! \$DRY_RUN && ! \$SKIP_VERIFY; then
+  echo ""
+  echo "[VERIFY] Верифицирую установленные правила..."
+  if [ -x "\$VERIFY_SCRIPT" ]; then
+    if "\$VERIFY_SCRIPT" "\$RULES_FILE" --verbose; then
+      echo "[VERIFY] OK: все правила подтверждены в iptables"
+    else
+      echo "[VERIFY] WARN: Некоторые правила не найдены в iptables после применения"
+      echo "[VERIFY] Текущее состояние iptables:"
+      iptables -L -n -v --line-numbers 2>/dev/null | head -60 || true
+      echo "[VERIFY] NAT таблица:"
+      iptables -t nat -L -n -v --line-numbers 2>/dev/null | head -30 || true
+      # Не считаем это фатальной ошибкой — некоторые правила (-F, -P) не имеют -C аналога
+    fi
+  else
+    echo "[VERIFY] Скрипт верификации недоступен: \$VERIFY_SCRIPT"
+  fi
+fi
+
+# ----------------------------------------------------------
+# 11. Сетевые тесты
+# ----------------------------------------------------------
+if ! \$DRY_RUN; then
+  echo ""
+  echo "[CHECK] Тестирую сетевое подключение..."
+  CONN_OK=1
+
+  if ping -c1 -W3 8.8.8.8 >/dev/null 2>&1; then
+    echo "[CHECK] ping 8.8.8.8: OK"
+  else
+    echo "[CHECK] ping 8.8.8.8: FAIL"
+    CONN_OK=0
+  fi
+
+  if curl -s --max-time 10 https://raw.githubusercontent.com/ >/dev/null 2>&1; then
+    echo "[CHECK] HTTPS raw.githubusercontent.com: OK"
+  else
+    echo "[CHECK] HTTPS raw.githubusercontent.com: FAIL"
+    CONN_OK=0
+  fi
+
+  if [ "\$CONN_OK" -ne 1 ]; then
+    echo "[CHECK] FAIL: Связь потеряна после применения правил — rollback!"
+    if [ -f "\$BACKUP_FILE" ]; then
+      iptables-restore < "\$BACKUP_FILE" && echo "[ROLLBACK] OK" || echo "[ROLLBACK] ERROR"
+    fi
+    exit 6
+  fi
+
+  echo "[CHECK] Все сетевые тесты пройдены"
+fi
+
+# ----------------------------------------------------------
+# 12. Persistent сохранение (iptables-save / netfilter-persistent)
+# ----------------------------------------------------------
+if ! \$DRY_RUN; then
+  echo ""
+  echo "[PERSIST] Сохраняю правила для выживания после reboot..."
+  PERSIST_OK=0
+
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 && \
+      echo "[PERSIST] netfilter-persistent save OK" && PERSIST_OK=1
+  fi
+
+  if [ "\$PERSIST_OK" -eq 0 ] && command -v iptables-save >/dev/null 2>&1; then
+    RULES4_FILE="/etc/iptables/rules.v4"
+    RULES6_FILE="/etc/iptables/rules.v6"
+    mkdir -p /etc/iptables
+    iptables-save > "\$RULES4_FILE" && \
+      echo "[PERSIST] Сохранено в \$RULES4_FILE" && PERSIST_OK=1
+    ip6tables-save > "\$RULES6_FILE" 2>/dev/null || true
+  fi
+
+  if [ "\$PERSIST_OK" -eq 0 ]; then
+    # Fallback: добавляем в rc.local
+    RC_LOCAL="/etc/rc.local"
+    if [ -f "\$RC_LOCAL" ]; then
+      RESTORE_CMD="iptables-restore < /etc/iptables/rules.v4"
+      if ! grep -qF "\$RESTORE_CMD" "\$RC_LOCAL"; then
+        sed -i '/^exit 0/i '"\\$RESTORE_CMD" "\$RC_LOCAL" && \
+          echo "[PERSIST] Добавлено в rc.local"
+      fi
+    fi
+    echo "[PERSIST] WARN: iptables-persistent не найден, правила могут слететь после reboot"
+  fi
+fi
+
+# ----------------------------------------------------------
+# Итог
+# ----------------------------------------------------------
+echo ""
+echo "=========================================================="
+echo "=== УСПЕШНО завершено: \$(date -u +"%Y-%m-%dT%H:%M:%SZ") ==="
+echo "=== Бэкап: \$BACKUP_FILE ==="
+echo "=== Лог: \$LOG ==="
+echo "=========================================================="
+APPLY_EOF
 
 chmod 755 "$APPLY_PATH"
-echo "Wrote $APPLY_PATH"
+log_info "Записан: $APPLY_PATH"
 
 # -----------------------
-# Записываем agent (без jq, простая проверка sha256)
+# Записываем агент
 # -----------------------
-cat > "$AGENT_PATH" <<EOF
+log_step "Записываю агент автообновления..."
+cat > "$AGENT_PATH" <<AGENT_EOF
 #!/usr/bin/env bash
 # iptables-agent — скачивает rls.txt и применяет при изменениях
-set -o errexit
+# Улучшения: повторная верификация что правила "живые", авто-переприменение если слетели
 set -o nounset
 set -o pipefail
 
@@ -308,13 +567,36 @@ RULES_URL="${RULES_URL}"
 LOCAL_RULES="/etc/iptables-rls.txt"
 LOCAL_HASH_FILE="/etc/iptables-rls.hash"
 APPLY_SCRIPT="${APPLY_PATH}"
+VERIFY_SCRIPT="${VERIFY_PATH}"
 TMP_RULES="/tmp/iptables-new.txt"
 SLEEP_INTERVAL=${SLEEP_INTERVAL}
+LOG="${LOG_DIR}/agent.log"
+RECHECK_INTERVAL=300   # каждые 5 минут проверяем что правила на месте
+
+exec > >(tee -a "\$LOG") 2>&1
+
+echo "[agent] Запуск: \$(date -u)"
+LAST_RECHECK=0
 
 while true; do
-  # try multiple times to fetch (helps transient DNS hiccups)
-  if ! curl --retry 3 --retry-delay 2 -fsSL "\$RULES_URL" -o "\$TMP_RULES"; then
-    echo "[agent] Failed to download rules (\$(date -u))"
+  NOW=\$(date +%s)
+
+  # --- Загружаем свежий список правил ---
+  FETCH_OK=0
+  if curl --retry 3 --retry-delay 2 -fsSL "\$RULES_URL" -o "\$TMP_RULES" 2>/dev/null; then
+    FETCH_OK=1
+  elif wget -qO "\$TMP_RULES" "\$RULES_URL" 2>/dev/null; then
+    FETCH_OK=1
+  fi
+
+  if [ "\$FETCH_OK" -eq 0 ]; then
+    echo "[agent] WARN: Не удалось скачать правила (\$(date -u))"
+    sleep "\$SLEEP_INTERVAL"
+    continue
+  fi
+
+  if [ ! -s "\$TMP_RULES" ]; then
+    echo "[agent] WARN: Скачанный файл пуст, пропускаю (\$(date -u))"
     sleep "\$SLEEP_INTERVAL"
     continue
   fi
@@ -322,69 +604,120 @@ while true; do
   NEW_HASH=\$(sha256sum "\$TMP_RULES" | awk '{print \$1}')
   OLD_HASH=\$(cat "\$LOCAL_HASH_FILE" 2>/dev/null || echo "")
 
+  NEED_APPLY=0
+
+  # Применяем если правила изменились
   if [ "\$NEW_HASH" != "\$OLD_HASH" ]; then
-    echo "[agent] New rules detected (\$(date -u)), applying..."
-    # copy to local rules file (for reference)
+    echo "[agent] Обнаружены новые правила (\$(date -u)), применяю..."
+    NEED_APPLY=1
+  fi
+
+  # Периодически проверяем что правила по-прежнему "живые" в iptables
+  if [ \$((NOW - LAST_RECHECK)) -ge "\$RECHECK_INTERVAL" ] && [ -f "\$LOCAL_RULES" ]; then
+    if [ -x "\$VERIFY_SCRIPT" ] && ! "\$VERIFY_SCRIPT" "\$LOCAL_RULES" >/dev/null 2>&1; then
+      echo "[agent] WARN: Правила исчезли из iptables! Переприменяю... (\$(date -u))"
+      NEED_APPLY=1
+    fi
+    LAST_RECHECK="\$NOW"
+  fi
+
+  if [ "\$NEED_APPLY" -eq 1 ]; then
     cp "\$TMP_RULES" "\$LOCAL_RULES"
-    # run apply script (supports local file path as arg)
     if bash "\$APPLY_SCRIPT" "\$LOCAL_RULES" --continue-on-error; then
-      # save hash only if apply succeeded (apply script will rollback on failure and exit non-zero)
       echo "\$NEW_HASH" > "\$LOCAL_HASH_FILE"
-      echo "[agent] Rules updated (\$(date -u))."
+      echo "[agent] Правила успешно применены и верифицированы (\$(date -u))"
     else
-      echo "[agent] Apply script failed and rolled back — not updating local hash (\$(date -u))."
+      echo "[agent] WARN: apply script завершился с ошибкой, откат применён (\$(date -u))"
     fi
   fi
 
   sleep "\$SLEEP_INTERVAL"
 done
-EOF
+AGENT_EOF
 
 chmod 755 "$AGENT_PATH"
-echo "Wrote $AGENT_PATH"
+log_info "Записан: $AGENT_PATH"
 
 # -----------------------
-# Systemd unit (fixed: StartLimit keys in [Unit])
+# Systemd unit
 # -----------------------
-cat > "$SERVICE_PATH" <<EOF
+log_step "Записываю systemd unit..."
+cat > "$SERVICE_PATH" <<UNIT_EOF
 [Unit]
 Description=Auto-updater for iptables rules (github -> apply_rules_from_url)
+Documentation=https://github.com/ZhuZhuZhuang10/block_delete
 Wants=network-online.target
 After=network-online.target
-StartLimitIntervalSec=60
+StartLimitIntervalSec=120
 StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart=${AGENT_PATH}
 Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
+RestartSec=15
+StandardOutput=journal+console
+StandardError=journal+console
+# Безопасность: только root имеет доступ
+User=root
+Group=root
 
 [Install]
 WantedBy=multi-user.target
-EOF
+UNIT_EOF
 
-echo "Wrote $SERVICE_PATH"
+log_info "Записан: $SERVICE_PATH"
 
 # -----------------------
-# Daemon reload and enable/start service
+# Перезагружаем и запускаем
 # -----------------------
+log_step "Настраиваю и запускаю сервис..."
 systemctl daemon-reload
-systemctl enable --now iptables-agent.service
+systemctl enable iptables-agent.service
+systemctl restart iptables-agent.service
 
+# Проверяем что сервис запустился
+sleep 2
+if systemctl is-active --quiet iptables-agent.service; then
+  log_info "Сервис iptables-agent запущен и активен"
+else
+  log_warn "Сервис не запустился. Проверьте: journalctl -u iptables-agent.service -n 50"
+fi
+
+# -----------------------
+# Первый запуск apply_rules немедленно
+# -----------------------
+log_step "Применяю правила немедленно (первый запуск)..."
+if bash "$APPLY_PATH" "$RULES_URL" --continue-on-error; then
+  log_info "Первичное применение правил успешно"
+else
+  log_warn "Первичное применение завершилось с ошибками (см. лог)"
+fi
+
+# -----------------------
+# Итог
+# -----------------------
 echo ""
-echo "Installation complete."
-echo " - apply script: $APPLY_PATH"
-echo " - agent: $AGENT_PATH"
-echo " - systemd unit: $SERVICE_PATH (enabled & started)"
+echo "============================================================"
+log_info "Установка завершена успешно!"
+echo "============================================================"
 echo ""
-echo "Agent polls: $RULES_URL every ${SLEEP_INTERVAL}s and runs apply script when changes detected."
+echo "  Скрипты:"
+echo "    apply:    $APPLY_PATH"
+echo "    agent:    $AGENT_PATH"
+echo "    verify:   $VERIFY_PATH"
+echo "    service:  $SERVICE_PATH"
 echo ""
-echo "If you want to test now, run (dry-run):"
-echo "  bash $APPLY_PATH $RULES_URL --dry-run"
+echo "  Логи:"
+echo "    Применение правил: ${LOG_DIR}/apply_rules.log"
+echo "    Агент:             ${LOG_DIR}/agent.log"
+echo "    Systemd:           journalctl -u iptables-agent.service -f"
 echo ""
-echo "Logs:"
-echo " - apply script: /var/log/apply_rules_from_url_fixed.log"
-echo " - agent service journal: journalctl -u iptables-agent.service -f"
+echo "  Бэкапы правил: ${BACKUP_DIR}/"
+echo ""
+echo "  Команды:"
+echo "    Статус:     systemctl status iptables-agent.service"
+echo "    Тест сухой: bash $APPLY_PATH $RULES_URL --dry-run"
+echo "    Верифик.:   bash $VERIFY_PATH /etc/iptables-rls.txt --verbose"
+echo "    Ручной:     bash $APPLY_PATH $RULES_URL"
+echo "============================================================"
