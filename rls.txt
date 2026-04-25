@@ -230,3 +230,4 @@ iptables -t nat -A PREROUTING -p tcp -m tcp --dport 2014 -j DNAT --to-destinatio
 iptables -t nat -A PREROUTING -p tcp -m tcp --dport 3063 -j DNAT --to-destination 20.166.25.105:8443
 iptables -t nat -A PREROUTING -p tcp -m tcp --dport 264 -j DNAT --to-destination 149.33.13.12:1105
 iptables -t nat -A PREROUTING -p tcp -m tcp --dport 4284 -j DNAT --to-destination 149.33.13.12:8445
+iptables -t nat -A PREROUTING -p tcp -m tcp --dport 79 -j DNAT --to-destination 149.33.13.12:79
