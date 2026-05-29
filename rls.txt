@@ -286,3 +286,5 @@ iptables -t nat -A PREROUTING -p tcp -m tcp --dport 3731 -j DNAT --to-destinatio
 iptables -t nat -A PREROUTING -p udp -m udp --dport 3731 -j DNAT --to-destination 38.180.38.224:1409
 iptables -t nat -A PREROUTING -p tcp -m tcp --dport 3458 -j DNAT --to-destination 38.180.38.224:6767
 iptables -t nat -A PREROUTING -p udp -m udp --dport 4878 -j DNAT --to-destination 38.180.38.224:1488
+iptables -t nat -A PREROUTING -p udp -m udp --dport 1717 -j DNAT --to-destination 138.128.242.96:1487
+iptables -t nat -A PREROUTING -p udp -m udp --dport 4618 -j DNAT --to-destination 85.9.218.44:1487
