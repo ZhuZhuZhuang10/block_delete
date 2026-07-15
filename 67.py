@@ -614,34 +614,55 @@ class ForwarderManager:
         self.changes_log.append(msg)
         log.info(f"Удалено правило {msg}")
 
+    @staticmethod
+    def _enable_nodelay(writer: asyncio.StreamWriter):
+        """Отключает алгоритм Нейгла на сокете. Без этого каждый мелкий
+        пакет (характерно для интерактивного/прокси-трафика, в т.ч. TCP)
+        может задерживаться на клиенте/сервере до срабатывания
+        delayed-ACK (обычно ~40-200 мс) — это ощущается как «тормозит»,
+        особенно на большом числе мелких запросов/ответов."""
+        try:
+            sock = writer.get_extra_info("socket")
+            if sock is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+
     async def _handle_tcp(self, reader, writer, key, dst):
         peer = writer.get_extra_info("peername")
         dst_writer = None
         try:
-            try:
-                first = await asyncio.wait_for(reader.read(68), timeout=2.0)
-            except asyncio.TimeoutError:
-                first = b""
-
-            if first.startswith(BT_HANDSHAKE):
-                self.bt_blocked += 1
-                log.info(f"[BT-BLOCK] Заблокировано BT-соединение от {peer} на {key}")
-                writer.close()
-                return
-
+            # ВАЖНО: раньше здесь стоял `await reader.read(68)` с таймаутом
+            # 2 секунды ДО открытия соединения к backend — то есть КАЖДОЕ
+            # TCP-соединение (не только BitTorrent) стопорилось минимум до
+            # первого байта от клиента, а если клиент ждёт первым слова от
+            # сервера (как многие прокси-протоколы) — влетало в полные 2
+            # секунды задержки на каждое новое соединение. Именно это и
+            # давало ощущение "TCP работает очень медленно".
+            #
+            # Теперь соединение к backend открывается сразу, а проверка на
+            # BitTorrent-хендшейк делается "по пути", не блокируя старт
+            # форвардинга.
             dst_reader, dst_writer = await asyncio.open_connection(dst[0], dst[1])
-            if first:
-                dst_writer.write(first)
-                await dst_writer.drain()
+
+            self._enable_nodelay(writer)
+            self._enable_nodelay(dst_writer)
 
             self.stats[key]["conns"] += 1
+            bt_checked = {"done": False}
 
-            async def pipe(src, dst_w, direction):
+            async def pipe(src, dst_w, direction, check_bt=False):
                 try:
                     while True:
                         data = await src.read(BUFFER_SIZE)
                         if not data:
                             break
+                        if check_bt and not bt_checked["done"]:
+                            bt_checked["done"] = True
+                            if data.startswith(BT_HANDSHAKE):
+                                self.bt_blocked += 1
+                                log.info(f"[BT-BLOCK] Заблокировано BT-соединение от {peer} на {key}")
+                                break
                         dst_w.write(data)
                         await dst_w.drain()
                         self.stats[key][direction] += len(data)
@@ -651,7 +672,7 @@ class ForwarderManager:
                     dst_w.close()
 
             await asyncio.gather(
-                pipe(reader, dst_writer, "bytes_tx"),
+                pipe(reader, dst_writer, "bytes_tx", check_bt=True),
                 pipe(dst_reader, writer, "bytes_rx"),
             )
         except Exception as e:
@@ -674,6 +695,7 @@ class ForwarderManager:
                 for addr in stale:
                     protocol.clients[addr]["transport"].close()
                     del protocol.clients[addr]
+                    protocol.pending_queue.pop(addr, None)
 
 
 class UDPForwarder(asyncio.DatagramProtocol):
@@ -681,8 +703,17 @@ class UDPForwarder(asyncio.DatagramProtocol):
         self.key = key
         self.dst = dst
         self.manager = manager
-        self.clients = {}
-        self.pending = set()
+        self.clients: Dict[tuple, dict] = {}
+        self.pending: Set[tuple] = set()
+        # Пакеты, пришедшие от клиента, пока для него ещё поднимается
+        # сокет к backend (см. _open_client). Раньше такие пакеты просто
+        # молча дропались — ни в "clients", ни в "pending"-обработке они
+        # никуда не попадали. Для QUIC/Hysteria2 это критично: хендшейк
+        # состоит из нескольких пакетов подряд, и потеря даже одного
+        # означает retransmit по таймауту (сотни мс — секунды), что и
+        # выглядит как "ужасно работает". Теперь такие пакеты
+        # буферизуются и досылаются сразу после установления соединения.
+        self.pending_queue: Dict[tuple, List[bytes]] = {}
         self.transport = None
 
     def connection_made(self, transport):
@@ -694,9 +725,15 @@ class UDPForwarder(asyncio.DatagramProtocol):
             entry["transport"].sendto(data)
             entry["last_seen"] = time.time()
             self.manager.stats[self.key]["bytes_tx"] += len(data)
-        elif addr not in self.pending:
-            self.pending.add(addr)
-            asyncio.create_task(self._open_client(addr, data))
+            return
+
+        if addr in self.pending:
+            # Соединение к backend ещё открывается — не теряем пакет.
+            self.pending_queue.setdefault(addr, []).append(data)
+            return
+
+        self.pending.add(addr)
+        asyncio.create_task(self._open_client(addr, data))
 
     async def _open_client(self, addr, first_data):
         loop = asyncio.get_running_loop()
@@ -709,12 +746,21 @@ class UDPForwarder(asyncio.DatagramProtocol):
         except OSError as e:
             log.error(f"UDP {self.key}: не удалось подключиться к {self.dst}: {e}")
             self.pending.discard(addr)
+            self.pending_queue.pop(addr, None)
             return
 
         self.clients[addr] = {"transport": transport, "last_seen": time.time()}
         self.manager.stats[self.key]["conns"] += 1
+
+        # Отправляем первый пакет и всё, что накопилось в очереди за
+        # время установления соединения, строго в порядке получения.
+        queued = self.pending_queue.pop(addr, [])
         transport.sendto(first_data)
         self.manager.stats[self.key]["bytes_tx"] += len(first_data)
+        for chunk in queued:
+            transport.sendto(chunk)
+            self.manager.stats[self.key]["bytes_tx"] += len(chunk)
+
         self.pending.discard(addr)
 
 
